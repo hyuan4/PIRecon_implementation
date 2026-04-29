@@ -98,7 +98,6 @@ class RawEvalMessageDataset(Dataset):
 # dataset/model preset selector
 DATA_PRESET = "lyme"
 ARTIFACT_TAG = DATA_PRESET
-REDUCED_LOSS = False
 DATA_PRESETS = {
     "ham10000": {
         "img_root": "../datasets/HAM10000/train",
@@ -159,17 +158,13 @@ def _artifact_tag() -> str:
     return str(ARTIFACT_TAG or DATA_PRESET)
 
 
-def _reduced_loss_enabled() -> bool:
-    return bool(REDUCED_LOSS)
-
-
 def _polish_dirname() -> str:
-    return "polish_reduced_loss" if _reduced_loss_enabled() else "polish"
+    return "polish_reduced_loss"
 
 
 def _summary_csv_name() -> str:
     p = Path(str(ABLATION_SUMMARY_CSV).strip())
-    if not _reduced_loss_enabled() or p.is_absolute():
+    if p.is_absolute():
         return str(p)
     return str(p.with_name(f"{p.stem}_reduced_loss{p.suffix}"))
 
@@ -261,26 +256,11 @@ LOSS_WEIGHTS_MAIN = {
 }
 NEW_BITS_WEIGHT = 5.0
 
-# realism-oriented objectives
-REALISM_FINE_TUNE = True
-GAN_START_EPOCH = 4
-DISC_LR = 2e-5
-DISC_WEIGHT_DECAY = 0.0
-DISC_UPDATE_INTERVAL = 8
-DISC_BASE = 32
-W_ADV_WARMUP = 0.0
-W_ADV_MAIN = 0.003
-W_TV_WARMUP = 0.03
-W_TV_MAIN = 0.02
-W_FREQ_WARMUP = 0.03
-W_FREQ_MAIN = 0.02
-FREQ_SPIKE_R_LOW = 0.75
-STEGO_STRUCT_LAP_LEVELS = 3
+# reduced realism objective
+REALISM_FINE_TUNE = False
 CHANNEL_STEP_INTERVAL = 4
 
 # explicit visibility loss on residual delta = stego-clean
-W_VIS_LPLOW = 0.10
-W_VIS_CHROMA = 0.08
 W_VIS_FLAT = 0.12
 VIS_EDGE_SCALE = 6.0
 
@@ -346,14 +326,9 @@ BER_TARGET = 0.005
 BER_HARD_MAX = 0.01
 BER_MSG_MIN_SCALE = 0.40
 BER_BUDGET_POWER = 1.0
-BER_HARD_PENALTY = 20.0
-BER_SOFT_PENALTY = 8.0
 BER_RT_TRIGGER = 0.005
-BER_RT_PENALTY = 0.10
-REDUCED_W_ADV_SCALE = 0.0
-REDUCED_W_TV_SCALE = 0.0
-REDUCED_BER_SOFT_PENALTY = 2.0
-REDUCED_BER_RT_PENALTY = 0.02
+CONSTRAINT_BER_SOFT_PENALTY = 2.0
+CONSTRAINT_RT_PENALTY = 0.02
 
 # stage resume controls
 START_FROM_MSB = 14
@@ -503,11 +478,6 @@ def parse_args():
         help="Base seed for --no-knowledge eval. Negative means sample a fresh random seed for this run.",
     )
     parser.add_argument(
-        "--reduced-loss",
-        action="store_true",
-        help="Use the reduced realism objective: keep only L_ref, L_constraint, and L_vis_flat; disable L_adv, L_ber-hard, L_tv, L_freq, L_vis_lowfreq, and L_vis_chroma.",
-    )
-    parser.add_argument(
         "--custom-unet-ckpt-path",
         type=str,
         default="",
@@ -545,12 +515,6 @@ def load_discriminator_state(discriminator: nn.Module, ckpt_obj: dict):
         )
 
 
-def total_variation_loss(x):
-    dx = x[:, :, :, 1:] - x[:, :, :, :-1]
-    dy = x[:, :, 1:, :] - x[:, :, :-1, :]
-    return dx.abs().mean() + dy.abs().mean()
-
-
 def _normalize_export_stem(path_like: str) -> str:
     stem = Path(str(path_like)).stem
     safe = "".join(ch if ch.isalnum() else "_" for ch in stem)
@@ -580,68 +544,9 @@ def save_eval_only_original_recovered(x, x_rec, paths, save_root: str, step: int
     return bsz
 
 
-def _radial_highfreq_mask(h, w, r_low, device, dtype):
-    fy = torch.fft.fftfreq(h, d=1.0, device=device)
-    fx = torch.fft.rfftfreq(w, d=1.0, device=device)
-    yy, xx = torch.meshgrid(fy, fx, indexing="ij")
-    rr = torch.sqrt(xx * xx + yy * yy) / math.sqrt(0.5 ** 2 + 0.5 ** 2)
-    mask = (rr >= float(r_low)).to(dtype=dtype)
-    return mask.view(1, 1, h, w // 2 + 1)
-
-
-def highfreq_spike_loss(y, r_low=0.75):
-    h, w = int(y.shape[-2]), int(y.shape[-1])
-    mask = _radial_highfreq_mask(h, w, r_low=float(r_low), device=y.device, dtype=torch.float32)
-    f = torch.fft.rfft2(y.float(), dim=(-2, -1))
-    power = (f.real.pow(2) + f.imag.pow(2)) * mask
-    return power.mean()
-
-
 def _to_gray(x):
     r, g, b = x[:, 0:1], x[:, 1:2], x[:, 2:3]
     return 0.2989 * r + 0.5870 * g + 0.1140 * b
-
-
-def chroma_consistency_loss(x, y):
-    xg = _to_gray(x)
-    yg = _to_gray(y)
-    xc = x - xg
-    yc = y - yg
-    return F.l1_loss(xc, yc)
-
-
-def laplacian(x):
-    k = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
-    k = k.repeat(x.size(1), 1, 1, 1)
-    return F.conv2d(x, k, padding=1, groups=x.size(1))
-
-
-def multiscale_lap_loss(a, b, levels=3):
-    loss = torch.zeros((), device=a.device, dtype=a.dtype)
-    xa = a
-    xb = b
-    count = 0
-    for _ in range(max(1, int(levels))):
-        loss = loss + F.l1_loss(laplacian(xa), laplacian(xb))
-        count += 1
-        if min(int(xa.shape[-2]), int(xa.shape[-1])) < 2:
-            break
-        xa = F.avg_pool2d(xa, kernel_size=2, stride=2)
-        xb = F.avg_pool2d(xb, kernel_size=2, stride=2)
-    return loss / float(max(1, count))
-
-
-def residual_lowfreq_loss(delta, levels=3):
-    loss = torch.zeros((), device=delta.device, dtype=delta.dtype)
-    x = delta
-    count = 0
-    for _ in range(max(1, int(levels))):
-        if min(int(x.shape[-2]), int(x.shape[-1])) < 2:
-            break
-        x = F.avg_pool2d(x, kernel_size=2, stride=2)
-        loss = loss + x.abs().mean()
-        count += 1
-    return loss / float(max(1, count))
 
 
 def set_requires_grad(module: nn.Module, enabled: bool):
@@ -1094,11 +999,9 @@ def compute_losses(
     else:
         token_acc_coarse = token_acc
 
-    hard_penalty = 0.0 if _reduced_loss_enabled() else float(BER_HARD_PENALTY)
     loss = (
         w_msg_eff * loss_msg
         + w_stego * loss_stego
-        + hard_penalty * loss_ber_hard
     )
 
     metrics = {
@@ -1131,33 +1034,17 @@ def get_loss_weights(epoch: int):
 
 
 def get_realism_weights(epoch: int):
-    if int(epoch) <= int(MSG_WARMUP_EPOCHS):
-        w = {
-            "w_adv": float(W_ADV_WARMUP),
-            "w_tv": float(W_TV_WARMUP),
-            "w_freq": float(W_FREQ_WARMUP),
-        }
-    else:
-        w = {
-        "w_adv": float(W_ADV_MAIN),
-        "w_tv": float(W_TV_MAIN),
-        "w_freq": float(W_FREQ_MAIN),
+    return {
+        "w_adv": 0.0,
+        "w_tv": 0.0,
+        "w_freq": 0.0,
     }
-    if _reduced_loss_enabled():
-        w["w_adv"] = float(w["w_adv"]) * float(REDUCED_W_ADV_SCALE)
-        w["w_tv"] = float(w["w_tv"]) * float(REDUCED_W_TV_SCALE)
-    return w
 
 
 def get_constraint_weights():
-    if _reduced_loss_enabled():
-        return {
-            "w_ber_soft": float(REDUCED_BER_SOFT_PENALTY),
-            "w_rt_trig": float(REDUCED_BER_RT_PENALTY),
-        }
     return {
-        "w_ber_soft": float(BER_SOFT_PENALTY),
-        "w_rt_trig": float(BER_RT_PENALTY),
+        "w_ber_soft": float(CONSTRAINT_BER_SOFT_PENALTY),
+        "w_rt_trig": float(CONSTRAINT_RT_PENALTY),
     }
 
 
@@ -1348,24 +1235,6 @@ def train_one_epoch(
                 target_block_idxs=target_block_idxs,
             )
 
-            do_d_update = (
-                discriminator is not None
-                and optim_d is not None
-                and bool(REALISM_FINE_TUNE)
-                and int(epoch) >= int(GAN_START_EPOCH)
-                and float(realism_w["w_adv"]) > 0.0
-                and (step % max(1, int(DISC_UPDATE_INTERVAL)) == 0)
-            )
-            if do_d_update:
-                optim_d.zero_grad()
-                y_real = outputs["y_clean"].detach()
-                y_fake = outputs["y_stego"].detach()
-                d_real = discriminator(y_real)
-                d_fake = discriminator(y_fake)
-                loss_disc = F.relu(1.0 - d_real).mean() + F.relu(1.0 + d_fake).mean()
-                loss_disc.backward()
-                optim_d.step()
-
             optimizer_vis.zero_grad()
             loss_base, metrics = compute_losses(
                 outputs,
@@ -1381,45 +1250,21 @@ def train_one_epoch(
             loss_rt_trig = rt_ratio * loss_rt_raw
 
             delta_img = outputs["y_stego"] - outputs["y_clean"]
-            loss_vis_lowfreq = (
-                torch.zeros((), device=device)
-                if _reduced_loss_enabled()
-                else residual_lowfreq_loss(delta_img, levels=int(STEGO_STRUCT_LAP_LEVELS))
-            )
-            loss_vis_chroma = (
-                torch.zeros((), device=device)
-                if _reduced_loss_enabled()
-                else chroma_consistency_loss(outputs["y_stego"], outputs["y_clean"])
-            )
+            loss_vis_lowfreq = torch.zeros((), device=device)
+            loss_vis_chroma = torch.zeros((), device=device)
             loss_vis_flat = edge_aware_residual_loss(
                 y_stego=outputs["y_stego"],
                 y_clean=outputs["y_clean"],
                 edge_scale=float(VIS_EDGE_SCALE),
             )
             loss_vis = (
-                float(W_VIS_LPLOW) * loss_vis_lowfreq
-                + float(W_VIS_CHROMA) * loss_vis_chroma
-                + float(W_VIS_FLAT) * loss_vis_flat
+                float(W_VIS_FLAT) * loss_vis_flat
             )
 
-            if (
-                discriminator is not None
-                and bool(REALISM_FINE_TUNE)
-                and int(epoch) >= int(GAN_START_EPOCH)
-                and float(realism_w["w_adv"]) > 0.0
-            ):
-                loss_adv_g = -discriminator(outputs["y_stego"]).mean()
-            loss_tv = total_variation_loss(outputs["y_stego"])
-            loss_freq = (
-                torch.zeros((), device=device)
-                if _reduced_loss_enabled()
-                else highfreq_spike_loss(outputs["y_stego"], r_low=float(FREQ_SPIKE_R_LOW))
-            )
+            loss_tv = torch.zeros((), device=device)
+            loss_freq = torch.zeros((), device=device)
             loss = (
                 loss_base
-                + float(realism_w["w_adv"]) * loss_adv_g
-                + float(realism_w["w_tv"]) * loss_tv
-                + float(realism_w["w_freq"]) * loss_freq
                 + loss_vis
                 + float(constraint_w["w_ber_soft"]) * loss_ber_soft_pen
                 + float(constraint_w["w_rt_trig"]) * loss_rt_trig
@@ -1609,50 +1454,26 @@ def eval_one_epoch(
             new_bits_weight=new_bits_weight,
         )
         loss_adv_g = torch.zeros((), device=device)
-        if (
-            discriminator is not None
-            and bool(REALISM_FINE_TUNE)
-            and int(epoch) >= int(GAN_START_EPOCH)
-            and float(realism_w["w_adv"]) > 0.0
-        ):
-            loss_adv_g = -discriminator(outputs["y_stego"]).mean()
-        loss_tv = total_variation_loss(outputs["y_stego"])
-        loss_freq = (
-            torch.zeros((), device=device)
-            if _reduced_loss_enabled()
-            else highfreq_spike_loss(outputs["y_stego"], r_low=float(FREQ_SPIKE_R_LOW))
-        )
+        loss_tv = torch.zeros((), device=device)
+        loss_freq = torch.zeros((), device=device)
         soft_ber = soft_ber_tensor(outputs, prev_active_bits=prev_payload_msb_bits)
         loss_ber_soft_pen = F.relu(soft_ber - float(BER_TARGET))
         rt_ratio = ((soft_ber - float(BER_RT_TRIGGER)) / float(max(1e-6, 1.0 - float(BER_RT_TRIGGER)))).clamp(0.0, 1.0)
         loss_rt_raw = F.l1_loss(outputs["z_rt"].float(), outputs["z_stego"].float().detach())
         loss_rt_trig = rt_ratio * loss_rt_raw
         delta_img = outputs["y_stego"] - outputs["y_clean"]
-        loss_vis_lowfreq = (
-            torch.zeros((), device=device)
-            if _reduced_loss_enabled()
-            else residual_lowfreq_loss(delta_img, levels=int(STEGO_STRUCT_LAP_LEVELS))
-        )
-        loss_vis_chroma = (
-            torch.zeros((), device=device)
-            if _reduced_loss_enabled()
-            else chroma_consistency_loss(outputs["y_stego"], outputs["y_clean"])
-        )
+        loss_vis_lowfreq = torch.zeros((), device=device)
+        loss_vis_chroma = torch.zeros((), device=device)
         loss_vis_flat = edge_aware_residual_loss(
             y_stego=outputs["y_stego"],
             y_clean=outputs["y_clean"],
             edge_scale=float(VIS_EDGE_SCALE),
         )
         loss_vis = (
-            float(W_VIS_LPLOW) * loss_vis_lowfreq
-            + float(W_VIS_CHROMA) * loss_vis_chroma
-            + float(W_VIS_FLAT) * loss_vis_flat
+            float(W_VIS_FLAT) * loss_vis_flat
         )
         loss_total = (
             loss_base
-            + float(realism_w["w_adv"]) * loss_adv_g
-            + float(realism_w["w_tv"]) * loss_tv
-            + float(realism_w["w_freq"]) * loss_freq
             + loss_vis
             + float(constraint_w["w_ber_soft"]) * loss_ber_soft_pen
             + float(constraint_w["w_rt_trig"]) * loss_rt_trig
@@ -1862,7 +1683,7 @@ def evaluate_final_metrics_for_ckpt(
         "data_preset": str(DATA_PRESET),
         "eval_mode": str(eval_tag or "standard"),
         "eval_split": str(eval_split),
-        "reduced_loss": bool(_reduced_loss_enabled()),
+        "reduced_loss": True,
         "stage_msb": int(stage_msb),
         "lora_decoder_last_n_upblocks": int(LORA_DECODER_LAST_N_UPBLOCKS),
         "conditioner_decoder_last_n_upblocks": int(CONDITIONER_DECODER_LAST_N_UPBLOCKS),
@@ -1929,7 +1750,6 @@ def main():
     global EVAL_ONLY_VAL_ROOT
     global EVAL_ONLY_VAL_TAIL_N
     global EVAL_ONLY_GENERATE_CLEAN
-    global REDUCED_LOSS
     global USE_CUSTOM_UNET
     global CUSTOM_UNET_CKPT_PATH
     global CACHE_ROOT
@@ -1941,7 +1761,6 @@ def main():
     if len(str(args.custom_unet_ckpt_path).strip()) > 0:
         USE_CUSTOM_UNET = True
         CUSTOM_UNET_CKPT_PATH = str(args.custom_unet_ckpt_path).strip()
-    REDUCED_LOSS = bool(args.reduced_loss)
     if bool(args.eval_only):
         EVAL_ONLY = True
     if len(str(args.eval_only_ckpt_path).strip()) > 0:
@@ -1971,10 +1790,7 @@ def main():
     if not bool(USE_WRITER_READER):
         raise RuntimeError("This script is locked to Writer+Reader+VAE LoRA mode. Set USE_WRITER_READER=True.")
     print("[Mode] Alternating Channel/Realism training + BER-constrained visual polish")
-    if _reduced_loss_enabled():
-        print(
-            "[LossMode] reduced_loss enabled: keeping L_ref + L_constraint + L_vis_flat only."
-        )
+    print("[LossMode] reduced objective: keeping L_ref + L_constraint + L_vis_flat only.")
     if bool(EVAL_ONLY_NO_KNOWLEDGE):
         print("[EvalMode] no_knowledge enabled: eval-only clean latents/images will be regenerated with empty prompt and fresh seed.")
 
@@ -2241,13 +2057,8 @@ def main():
         f"trainable_params={sum(p.numel() for p in wr_params)}, lr={WRITER_READER_LR}, wd={WRITER_READER_WEIGHT_DECAY}"
     )
 
-    discriminator = PatchDiscriminator(in_ch=3, base=int(DISC_BASE)).to(device)
-    disc_params = [p for p in discriminator.parameters() if p.requires_grad]
-    print(
-        f"[D] trainable_params={sum(p.numel() for p in disc_params)}, "
-        f"lr={DISC_LR}, wd={DISC_WEIGHT_DECAY}, base={DISC_BASE}, "
-        f"every={DISC_UPDATE_INTERVAL} step(s), gan_start={GAN_START_EPOCH}"
-    )
+    discriminator = None
+    disc_params = []
 
     ckpt_root = SCRIPT_DIR / f"ckpt/{_artifact_tag()}/{_polish_dirname()}"
     ckpt_root.mkdir(parents=True, exist_ok=True)
@@ -2417,9 +2228,7 @@ def main():
                 }
             ]
         )
-        optim_d = torch.optim.Adam(
-            [{"params": disc_params, "lr": float(DISC_LR), "weight_decay": float(DISC_WEIGHT_DECAY)}]
-        )
+        optim_d = None
 
         best_val = 1e9
         best_gate_fallback = 1e9
@@ -2511,9 +2320,9 @@ def main():
                 "vae_lora": dump_lora_state(lora_modules),
                 "writer": writer.state_dict() if writer is not None else None,
                 "reader": reader.state_dict() if reader is not None else None,
-                "discriminator": discriminator.state_dict() if discriminator is not None else None,
+                "discriminator": None,
                 "epoch": epoch,
-                "reduced_loss": bool(_reduced_loss_enabled()),
+                "reduced_loss": True,
                 "disabled_losses": [
                     "L_adv",
                     "L_ber-hard",
@@ -2521,7 +2330,7 @@ def main():
                     "L_freq",
                     "L_vis_lowfreq",
                     "L_vis_chroma",
-                ] if _reduced_loss_enabled() else [],
+                ],
                 "stage_idx": stage_idx,
                 "stage_msb": stage_msb,
                 "prev_stage_msb": prev_stage_msb,
@@ -2539,34 +2348,22 @@ def main():
                 "writer_hidden": int(WRITER_HIDDEN),
                 "reader_hidden": int(READER_HIDDEN),
                 "writer_reader_lr": float(WRITER_READER_LR),
-                "disc_lr": float(DISC_LR),
-                "disc_update_interval": int(DISC_UPDATE_INTERVAL),
-                "disc_base": int(DISC_BASE),
-                "w_adv_warmup": float(W_ADV_WARMUP),
-                "w_adv_main": float(W_ADV_MAIN),
-                "w_tv_warmup": float(W_TV_WARMUP),
-                "w_tv_main": float(W_TV_MAIN),
-                "effective_w_tv_scale": float(REDUCED_W_TV_SCALE if _reduced_loss_enabled() else 1.0),
+                "effective_w_tv_scale": 0.0,
                 "effective_w_tv_main": float(effective_realism_w["w_tv"]),
-                "w_freq_warmup": float(W_FREQ_WARMUP),
-                "w_freq_main": float(W_FREQ_MAIN),
                 "channel_step_interval": int(CHANNEL_STEP_INTERVAL),
-                "w_vis_lplow": float(W_VIS_LPLOW),
-                "w_vis_chroma": float(W_VIS_CHROMA),
                 "w_vis_flat": float(W_VIS_FLAT),
                 "vis_edge_scale": float(VIS_EDGE_SCALE),
-                "stego_struct_lap_levels": int(STEGO_STRUCT_LAP_LEVELS),
                 "best_ckpt_ber_max": float(BEST_CKPT_BER_MAX),
                 "ber_budget_enable": bool(BER_BUDGET_ENABLE),
                 "ber_target": float(BER_TARGET),
                 "ber_hard_max": float(BER_HARD_MAX),
                 "ber_msg_min_scale": float(BER_MSG_MIN_SCALE),
                 "ber_budget_power": float(BER_BUDGET_POWER),
-                "ber_hard_penalty": float(BER_HARD_PENALTY),
-                "ber_soft_penalty": float(BER_SOFT_PENALTY),
+                "ber_hard_penalty": 0.0,
+                "ber_soft_penalty": float(CONSTRAINT_BER_SOFT_PENALTY),
                 "effective_ber_soft_penalty": float(effective_constraint_w["w_ber_soft"]),
                 "ber_rt_trigger": float(BER_RT_TRIGGER),
-                "ber_rt_penalty": float(BER_RT_PENALTY),
+                "ber_rt_penalty": float(CONSTRAINT_RT_PENALTY),
                 "effective_ber_rt_penalty": float(effective_constraint_w["w_rt_trig"]),
                 "conditioner_decoder_last_n_upblocks": int(CONDITIONER_DECODER_LAST_N_UPBLOCKS),
                 "conditioner_gamma_scale": float(CONDITIONER_GAMMA_SCALE),
