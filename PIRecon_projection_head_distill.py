@@ -361,7 +361,6 @@ class VQCodec:
             quant, _, info = out[0], out[1], out[2]
             indices = info[2]   # min_encoding_indices
         else:
-            # 兜底：如果你的 VQ 模型 encode 返回 dict / object
             if hasattr(out, "quant") and hasattr(out, "indices"):
                 quant, indices = out.quant, out.indices
             elif isinstance(out, dict) and ("quant" in out) and ("indices" in out):
@@ -374,11 +373,9 @@ class VQCodec:
 
         indices = indices.to(torch.int64)
 
-        # 关键：用 quant 的空间分辨率来恢复 (Ht, Wt)
         B = x.size(0)
         Ht, Wt = int(quant.shape[-2]), int(quant.shape[-1])
 
-        # 常见三种 shape： (B*Ht*Wt,), (B, Ht*Wt), (B, Ht, Wt)
         if indices.dim() == 1:
             # (B*Ht*Wt,)
             if indices.numel() != B * Ht * Wt:
@@ -411,7 +408,6 @@ class VQCodec:
         B, Ht, Wt = indices.shape
         e_dim = int(self.vq.quantize.e_dim)
 
-        # ✅ 保持 (B,H,W)，不要 flatten
         indices_hw = indices.to(torch.long).view(B, Ht, Wt)
 
         # taming: get_codebook_entry(indices, shape=(B,H,W,C))
@@ -419,17 +415,13 @@ class VQCodec:
             indices_hw, shape=(B, Ht, Wt, e_dim)
         )
 
-        # ✅ 自动判断输出 layout
-        # 情况1：返回 NCHW: (B, C, H, W)
         if z_q.dim() == 4 and z_q.shape[1] == e_dim:
             z_q_nchw = z_q
-        # 情况2：返回 NHWC: (B, H, W, C)
         elif z_q.dim() == 4 and z_q.shape[-1] == e_dim:
             z_q_nchw = z_q.permute(0, 3, 1, 2).contiguous()
         else:
             raise RuntimeError(f"Unexpected z_q shape from codebook: {tuple(z_q.shape)}")
 
-        # ✅ 现在一定是 (B,256,Ht,Wt)
         x = self.vq.decode(z_q_nchw)
         return x.clamp(-1, 1)
 
