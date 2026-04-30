@@ -4,7 +4,7 @@ Official implementation of `Your Synthetic Image Is a Confession: Trojaning Imag
 
 ## Usage
 
-1. Train a VQ model, or use any public pretrained VQ weights.
+1. Train a VQ model, or use any public pretrained VQ weights. We follow this repo to finetune the VQ model: https://github.com/CompVis/taming-transformers, and the pretrained weights we choose is vqgan_imagenet_f16_16384. 
 2. Distill the VQ model into a VAE-encoder-style projection head by running:
 
    ```bash
